@@ -10,10 +10,21 @@ not converge on one idea:
 | B | [B-done-overlay.md](B-done-overlay.md) | Big "Erledigt" stamp with checkmark over the hero, entrance and exit, then the next view |
 | C | [C-hero-exit-transition.md](C-hero-exit-transition.md) | The hero bars themselves animate away; lightest option, no new assets if possible |
 
-Pick one, or combine (for example B's overlay with A's particles behind it).
-None of them is implemented. Nothing was compiled: the sandbox that wrote them
-has no PlatformIO and no LVGL source, so every LVGL call was checked against
-the v9.2.2 sources on GitHub and all frame rates are estimates.
+## Decision (2026-10-16)
+
+All three were implemented on separate branches and tried on the device the
+same evening. **Plan B, the done overlay, was chosen** and merged to `main`,
+with hardening on top: the acknowledgement loader no longer stalls one second
+at boot (`File::parseInt` timing out at end of file), a corrupt
+acknowledgement beyond the hero window is cleared instead of hiding the
+calendar, and a fetch window waits while the card is up. Plans A and C stay
+on their branches for reference (`plan-a-particles`, `plan-c-hero-exit`,
+both based on commit 0ab0444); their documents below are unchanged.
+
+The three plans were written and implemented without a compiler: the sandbox
+that produced them has no PlatformIO, so every LVGL call was checked against
+the v9.2.2 sources and the code was syntax-checked with a host g++ against
+the LVGL headers. The device builds were done by the owner.
 
 ## Comparison
 
@@ -114,7 +125,8 @@ syntax check against the LVGL 9.2.2 headers with stand-in Arduino headers.
 | B | `plan-b-done-overlay` | 98a66bd | `s` single hero without "Danach", `w` fetch window now |
 | C | `plan-c-hero-exit` | 06d689e | `1` one bar, `4` four bars |
 
-To test one: `git checkout <branch>`, then
+Plan B is on `main` (branch `plan-b-done-overlay` was merged and deleted).
+To try A or C: `git checkout <branch>`, then
 `pio run -e esp32-2432S028R-test -t upload && pio device monitor`. Press `x`
 between scenarios: on B and C the mark covers every earlier day, on A it is a
 set of up to four days.
