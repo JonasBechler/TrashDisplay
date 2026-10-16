@@ -26,7 +26,6 @@ static lv_timer_t *dialog_timer; // closes an unanswered dialog
 static int32_t dialog_day = -1;  // pickup day the open dialog is about
 static bool dialog_undo = false; // true: the dialog offers to lift an acknowledgement
 static lv_indev_t *touch_indev = NULL;
-static lv_indev_read_cb_t touch_driver_read = NULL;
 static uint32_t touch_wake_until_ms = 0; // backlight forced on until then after a touch
 
 void update_display();
@@ -398,43 +397,18 @@ void update_display()
 
 // ---------------------------------------------------------------- touch
 
-// esp32-smartdisplay rotates the panel in hardware when the display rotation
-// changes, but the touch controller keeps reporting in the native 240x320
-// portrait frame, and LVGL 9 no longer rotates pointer input itself. This
-// wrapper around the library's read callback maps each point into the rotated
-// frame. The mapping follows the MADCTL bits the library sets per rotation and
-// is not yet confirmed on hardware: in landscape a tap on the top-left corner
-// must log close to 0,0 (see on_touch_pressed).
-static void touch_read_rotated(lv_indev_t *indev, lv_indev_data_t *data)
-{
-    touch_driver_read(indev, data);
-    if (data->state != LV_INDEV_STATE_PRESSED)
-    {
-        return;
-    }
-    lv_display_t *disp = lv_indev_get_display(indev);
-    int32_t w = lv_display_get_horizontal_resolution(disp); // already rotated
-    int32_t h = lv_display_get_vertical_resolution(disp);
-    int32_t x = data->point.x; // native portrait frame
-    int32_t y = data->point.y;
-    switch (lv_display_get_rotation(disp))
-    {
-    case LV_DISPLAY_ROTATION_90:
-        data->point.x = w - 1 - y;
-        data->point.y = x;
-        break;
-    case LV_DISPLAY_ROTATION_180:
-        data->point.x = w - 1 - x;
-        data->point.y = h - 1 - y;
-        break;
-    case LV_DISPLAY_ROTATION_270:
-        data->point.x = y;
-        data->point.y = h - 1 - x;
-        break;
-    default:
-        break;
-    }
-}
+// esp32-smartdisplay rotates only the panel when the display rotation changes;
+// the XPT2046 keeps reporting in the native 240x320 portrait frame. LVGL 9.2
+// maps pointer input into the rotated frame itself (indev_pointer_proc in
+// lv_indev.c, the same formula as the panel's MADCTL rotation), so the
+// firmware adds no mapping of its own. An earlier read-callback wrapper applied
+// that rotation a second time: on hardware the top-left corner then logged
+// 29,205 and the top-right corner made LVGL warn "Y is -48 which is smaller
+// than zero". Without it the corners measured 36,33 / 287,31 / 290,210 /
+// 32,212 clockwise from top-left (see on_touch_pressed): the uncalibrated
+// panel stays about 30 px short of the edges, fine for the centred dialog
+// buttons. A press on the very edge can still make LVGL warn "Y is -1": the
+// driver mirrors X as x_max - x, one pixel past the edge, and LVGL clamps it.
 
 // every press wakes the backlight and logs the mapped point for a mapping check
 static void on_touch_pressed(lv_event_t *e)
@@ -453,8 +427,6 @@ static void setup_touch()
         Serial.println("no touch input device");
         return;
     }
-    touch_driver_read = lv_indev_get_read_cb(touch_indev);
-    lv_indev_set_read_cb(touch_indev, touch_read_rotated);
     lv_indev_add_event_cb(touch_indev, on_touch_pressed, LV_EVENT_PRESSED, NULL);
 }
 
@@ -678,6 +650,71 @@ static uint32_t lv_last_tick = 0;
 static uint32_t last_render_ms = 0;
 static bool had_valid_time = false;
 
+#ifdef TEST_HOOKS
+// Serial single-key commands to exercise the touch flow without waiting for a
+// real pickup day (build with -e esp32-2432S028R-test). Injected dates live in
+// RAM only: cache_save runs after a successful fetch, which replaces this
+// year's rows, and a reboot drops them. The acknowledgement of an injected day
+// is persisted like any other and would hide a real pickup on that date, so
+// send x before the test ends.
+//   h  Gelber Sack tomorrow and Altpapier the day after: a hero, and after
+//      "Ja" the adjacent-hero case
+//   0  Restmüll today: a "HEUTE:" hero until the rollover hour
+//   x  lift the acknowledgement
+//   u  re-render
+static void test_inject(uint8_t type, int32_t day)
+{
+    if (pickup_count >= MAX_PICKUPS)
+    {
+        Serial.println("test: pickup table full");
+        return;
+    }
+    pickups[pickup_count].day = day;
+    pickups[pickup_count].type = type;
+    pickup_count++;
+    sort_pickups();
+}
+
+static void test_hooks()
+{
+    while (Serial.available() > 0)
+    {
+        int c = Serial.read();
+        if (c != 'h' && c != '0' && c != 'x' && c != 'u')
+        {
+            continue; // line endings and unknown keys
+        }
+        if (time(NULL) < min_valid_epoch)
+        {
+            Serial.println("test: time not valid yet");
+            return;
+        }
+        struct tm t;
+        int32_t today = today_day(&t);
+        switch (c)
+        {
+        case 'h':
+            test_inject(GELB, today + 1);
+            test_inject(PAPIER, today + 2);
+            Serial.println("test: Gelber Sack tomorrow, Altpapier the day after");
+            break;
+        case '0':
+            test_inject(REST, today);
+            Serial.println("test: Restmüll today");
+            break;
+        case 'x':
+            ack_clear();
+            Serial.println("test: acknowledgement lifted");
+            break;
+        default:
+            break;
+        }
+        update_display();
+        last_render_ms = millis();
+    }
+}
+#endif
+
 void setup()
 {
     Serial.begin(115200);
@@ -714,6 +751,9 @@ void loop()
     lv_tick_inc(now_ms - lv_last_tick);
     lv_last_tick = now_ms;
     lv_timer_handler();
+#ifdef TEST_HOOKS
+    test_hooks();
+#endif
 
     time_t now = time(NULL);
     bool time_valid = now > min_valid_epoch;

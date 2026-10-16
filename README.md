@@ -74,32 +74,46 @@ the lights off.
 ## Touch
 
 The XPT2046 reports in the panel's native 240x320 frame. esp32-smartdisplay
-rotates only the LCD when the display rotation changes, and LVGL 9 does not
-rotate pointer input, so `setup_touch()` in main.cpp wraps the input device's
-read callback and maps every point into the landscape frame. The mapping is
-derived from the MADCTL bits the library sets per rotation and has not been
-confirmed on hardware yet. Every press logs the mapped point on the
-serial console:
+rotates only the LCD when the display rotation changes, and LVGL 9.2 rotates
+pointer input itself (`indev_pointer_proc` in `lv_indev.c`), so the firmware
+adds no mapping of its own. An earlier build wrapped the input device's read
+callback with the same rotation, which applied it twice: taps landed on the
+wrong spot (top-left corner logged as 29,205) and LVGL warned "Y is -48 which
+is smaller than zero" for the top-right corner. Every press logs the mapped
+point on the serial console:
 
 ```
 touch 12,9
 ```
 
 In landscape a tap near the top-left corner must log values near 0,0 and the
-bottom-right corner values near 319,239. If an axis comes out mirrored, flip
+bottom-right corner values near 319,239. The panel is not calibrated and
+stops about 30 px short of each edge: on the test unit the corners read
+36,33 / 287,31 / 290,210 / 32,212 clockwise from top-left. A press on the
+very edge can make LVGL log "Y is -1 which is smaller than zero"; the driver
+mirrors X as `x_max - x`, one pixel past the edge, and LVGL clamps it, so the
+line is harmless. If an axis comes out mirrored, flip
 `TOUCH_MIRROR_X` or `TOUCH_MIRROR_Y` in `boards/esp32-2432S028R.json`. The
-panel is not calibrated; the dialog buttons are 130x56 pixels and sit in the
-middle of the screen, where an uncalibrated resistive panel is accurate
-enough. A tap mapped with swapped or inverted axes lands on the backdrop or
-the card text, which cancels or does nothing. The one exception is a pure
-left-right mirror, which would swap Ja and Nein; the corner check above
-catches that before the dialog is trusted.
+dialog buttons are 130x56 pixels and sit in the middle of the screen, where
+an uncalibrated resistive panel is accurate enough. A tap mapped with swapped
+or inverted axes lands on the backdrop or the card text, which cancels or
+does nothing. The one exception is a pure left-right mirror, which would swap
+Ja and Nein; the corner check above catches that before the dialog is
+trusted.
 
 ## Setup
 
 1. Copy `src/Config_example.h` to `src/Config.h`, set WiFi credentials and the
    address filters (street, segment, PLZ as spelled in the dataset).
 2. Build and flash: `pio run -e esp32-2432S028R -t upload`.
+
+To try the touch flow without waiting for a pickup day, flash the test
+environment instead (`pio run -e esp32-2432S028R-test -t upload`) and type
+single keys in `pio device monitor`: `h` injects Gelber Sack tomorrow and
+Altpapier the day after, `0` injects Restmüll today, `x` lifts the
+acknowledgement, `u` re-renders. Injected dates live in RAM only; the
+acknowledgement of an injected day is stored like any other, so end a test
+with `x`.
 
 The German labels need umlauts, which LVGL's built-in fonts lack. The fonts in
 `src/fonts/` were generated with:
