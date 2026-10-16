@@ -722,9 +722,10 @@ static void fetch_log_dump()
 
 // ---------------------------------------------------------------- acknowledgement
 
-// Pickup day the user confirmed on the touch screen as handled (bins are out).
-// Its types count as collected until that day's rollover hour. Kept in a
-// one-line file so it survives a reboot.
+// Newest pickup day the user confirmed on the touch screen as handled (bins are
+// out). It and every earlier pickup day count as collected, each until its own
+// rollover hour (see pickup_pending). Kept in a one-line file so it survives a
+// reboot.
 static int32_t acked_day = -1;
 static const char *ack_path = "/ack.txt";
 
@@ -764,6 +765,44 @@ static void ack_clear()
 static bool ack_active(int32_t today, int hour)
 {
     return acked_day >= 0 && (acked_day > today || (acked_day == today && hour < rollover_hour));
+}
+
+// true if pickup day d still lies ahead under the rollover rule and is not acknowledged.
+// An acknowledgement covers its day and every earlier one: the hero always shows the
+// earliest pending day, so earlier pending days were acknowledged before. One int thus
+// stands for a set of days that each drop out at their own rollover. A single-day mark
+// made consecutive pickup days (Bio Monday, Rest Tuesday) alternate forever: marking
+// Tuesday un-marked Monday, whose hero came back.
+static bool pickup_pending(int32_t d, int32_t today, int hour)
+{
+    if (d < today || (d == today && hour >= rollover_hour))
+    {
+        return false;
+    }
+    return d > acked_day;
+}
+
+// Undo lifts only the newest acknowledged day: the mark steps back to the latest
+// earlier pickup day still ahead, which stays acknowledged, or is cleared if none is.
+static void ack_step_back(int32_t today, int hour)
+{
+    int32_t prev = -1;
+    for (int i = 0; i < pickup_count && pickups[i].day < acked_day; i++) // sorted ascending
+    {
+        int32_t d = pickups[i].day;
+        if (d > today || (d == today && hour < rollover_hour))
+        {
+            prev = d;
+        }
+    }
+    if (prev >= 0)
+    {
+        ack_set(prev);
+    }
+    else
+    {
+        ack_clear();
+    }
 }
 
 

@@ -298,3 +298,75 @@ static void on_overlay_clicked(lv_event_t *e)
 - **Resources:** run 10 overlay cycles and compare heap free and biggest block. They must not drift.
 - **Glyph:** a rectangle instead of the check means the glyph is missing (`LV_USE_FONT_PLACEHOLDER 1`).
 - **Dark room:** cover the light sensor. The backlight must stay on through the whole sequence.
+
+## Implementation notes
+
+Implemented on branch `plan-b-done-overlay`. Not compiled and not run: the
+sandbox has no PlatformIO. Every LVGL name was checked against the v9.2.2
+sources. Deviations from the plan above:
+
+- **Test hooks instead of `TRASH_DEBUG`.** Step 8 is built into the existing
+  `test_hooks()` behind `TEST_HOOKS` (environment `esp32-2432S028R-test`), not a
+  new `debug_serial()` behind `TRASH_DEBUG`. The keys that were already there
+  keep their meaning:
+  - `h` stays Gelber Sack tomorrow plus Altpapier the day after, not Bio plus
+    Rest. It covers the same consecutive-days case.
+  - `x` stands in for `c`.
+  - `0` (Restmüll today) stands in for `t`.
+  - New keys are `s` (Gelber Sack tomorrow alone) and `w` (`next_fetch_epoch = 0`).
+  - `test_inject` now skips a day and type that is already listed, as the
+    plan's `h` did. A second key press therefore never lists a bin twice.
+- **Frame counter.** It is compiled only into the test build. It counts
+  `LV_EVENT_RENDER_READY`, not `LV_EVENT_REFR_READY`. In 9.2.2
+  `lv_display_refr_timer` sends `REFR_READY` on every run, including runs that
+  only updated the layout and drew nothing (`goto refr_finish`, `lv_refr.c:400`).
+  `RENDER_READY` is sent only after something was drawn. The counter is reset in
+  `overlay_show`.
+  - Production prints `overlay idle after N ms`.
+  - The test build prints `overlay idle after N ms, F frames`.
+- **Flag calls are split.** `lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE |
+  LV_OBJ_FLAG_SCROLLABLE)` does not compile in C++. `lv_obj_flag_t` is a plain
+  enum in 9.2.2 (`lv_obj.h:128`), the `|` yields `int`, and C++ does not convert
+  `int` to an enum implicitly. Each flag is cleared in its own call, as the rest
+  of `main.cpp` already does.
+- **Extra serial lines** beyond the plan's list:
+  - `late Ja after dialog timeout ignored`: the `dialog_day < 0` guard fired.
+  - `done overlay stuck, closing it`: `update_display()` passed `ov_stuck_ms`
+    and force-closed the overlay. A fetch window longer than about 10 s does
+    this with no bug involved; the card then disappears without the fade.
+  - The undo line now reads `acknowledgement of day N lifted, now up to day M`.
+    M is -1 when the mark was cleared.
+- **README.** The dialog behaviour lives in "Display behavior", not in "Touch",
+  so the new text went there. The test keys and the font command went into
+  "Setup".
+- **Line numbers.** The line numbers in this plan predate the removal of the
+  touch rotation wrapper. Code was placed by function name, not by line.
+- **Font.** `src/fonts/symbol_check_48.c` was generated with the command in
+  step 2, using the woff from lvgl v9.2.2 `scripts/built_in_font/`. The glyph
+  box is 48×36 px with offset 0,0, line height 36 and a bitmap of 864 bytes. The
+  check label is therefore 48×36 px and is centred in the circle with
+  `lv_obj_center`.
+- **"heute" in the hint.** The branch is kept, although an acknowledged day is
+  always today or later and the next pending day is therefore at least tomorrow.
+
+Checked against the v9.2.2 sources (plan assumptions confirmed):
+
+- `lv_anim_init` sets `early_apply = 1` (`lv_anim.c:83`).
+- `lv_anim_path_overshoot` is `cubic_bezier(341, 0, 683, 1300)`. Its maximum is
+  about 1.036, so the circle peaks at about 78 px.
+- `anim_completed_handler` unlinks the animation before `completed_cb`
+  (`lv_anim.c:584-589`). The `lv_anim_delete` in `overlay_finish` is therefore
+  safe when the fade's own callback calls it.
+- `indev_proc_release` sends `CLICKED` without checking `HIDDEN`
+  (`lv_indev.c:1358`). The `dialog_day < 0` guard is needed.
+- `LV_EVENT_SIZE_CHANGED` marks every child as layout-dirty (`lv_obj.c:840-852`).
+  The check glyph therefore stays centred while the circle grows.
+- Flex placement (`lv_flex.c:260`, `:376`) and `LV_SIZE_CONTENT` height
+  (`lv_obj_pos.c`, `calc_content_height`) skip hidden children. The card
+  therefore shrinks when the hint is hidden.
+- The default theme gives a plain `lv_obj` only the card and scrollbar styles.
+  Border, padding, radius and `pad_row` are overridden locally.
+
+Still open, owner to check on the device: the first build, whether the glyph
+sits centred, the pop and fade frame rates, whether the dimmed hero can be read
+through the 70 % veil, and the 400 ms bounce guard.

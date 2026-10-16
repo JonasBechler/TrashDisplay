@@ -52,12 +52,25 @@ successful fetch is older than 14 days, a grey "Daten vom DD.MM." line
 appears; it turns red after 30 days.
 
 In hero mode a tap anywhere on the screen opens a confirm dialog ("Als
-erledigt markieren?", Ja / Nein). Ja marks that pickup day as handled: its
-bins count as collected until the day's rollover at 10:00, the display moves
-on to the next pickup, and a grey "Erledigt: Mo 05.10." line sits
-bottom-right. The mark is stored in LittleFS and survives a reboot. While it
-is active and no hero is on screen, a tap offers to lift it again. A dialog
-nobody answers closes after 15 seconds; a tap on the dimmed backdrop cancels.
+erledigt markieren?", Ja / Nein). Ja marks that pickup day as handled and
+confirms it with a dark green card over the dimmed hero: a white circle pops
+open with a check mark, next to it "Erledigt", below it the bins of that day.
+If the next pickup is close enough for a hero of its own, an amber line names
+it ("Danach: Restmüll übermorgen"). After about 1.8 seconds the card leaves
+and the dimming fades out over the next view, about 2.1 seconds in all; a tap
+after the first 0.4 seconds skips the wait. The bins of the marked day count
+as collected until the day's rollover at 10:00, and a grey "Erledigt: Mo
+05.10." line sits bottom-right.
+
+A mark covers its day and every earlier pickup day still ahead, each until
+its own rollover. With pickups on consecutive days (Bio Monday, Rest Tuesday)
+Ja on the Monday hero brings up the Tuesday hero, Ja on that one the list,
+and Monday does not come back. The mark is stored in LittleFS (one day in
+`/ack.txt`) and survives a reboot. While it is active and no hero is on
+screen, a tap offers to lift it again ("Markierung aufheben?"). That lifts
+only the newest marked day: the mark steps back to the previous pickup day
+still ahead, which stays marked. A dialog nobody answers closes after 15
+seconds; a tap on the dimmed backdrop cancels.
 
 ## Power
 
@@ -110,10 +123,14 @@ trusted.
 To try the touch flow without waiting for a pickup day, flash the test
 environment instead (`pio run -e esp32-2432S028R-test -t upload`) and type
 single keys in `pio device monitor`: `h` injects Gelber Sack tomorrow and
-Altpapier the day after, `0` injects Restmüll today, `x` lifts the
-acknowledgement, `u` re-renders. Injected dates live in RAM only; the
-acknowledgement of an injected day is stored like any other, so end a test
-with `x`.
+Altpapier the day after (two heroes in a row), `s` injects Gelber Sack
+tomorrow alone, `0` injects Restmüll today, `x` lifts the acknowledgement,
+`u` re-renders, `w` starts a fetch window now. Injected dates live in RAM
+only; the acknowledgement of an injected day is stored like any other, so end
+a test with `x`. A fetch drops injected dates of the current year; on 30 and
+31 December do not send `w` after `h` or `s`, since a date in the next year
+would be saved with the cache. The test build also counts the frames drawn
+while the done card is up and adds them to the `overlay idle` log line.
 
 The German labels need umlauts, which LVGL's built-in fonts lack. The fonts in
 `src/fonts/` were generated with:
@@ -125,4 +142,11 @@ npx lv_font_conv@1.5.3 --font Montserrat-Medium.ttf -r 0x20-0x7E \
 ```
 
 (sizes 16, 20 and 32; the TTF ships with the lvgl package under
-`scripts/built_in_font/`).
+`scripts/built_in_font/`). The check mark of the done card is a one-glyph
+font made from the FontAwesome file in the same directory:
+
+```
+npx lv_font_conv@1.5.3 --font FontAwesome5-Solid+Brands+Regular.woff \
+  -r 0xF00C --size 48 --bpp 4 --no-compress --format lvgl \
+  -o src/fonts/symbol_check_48.c
+```
