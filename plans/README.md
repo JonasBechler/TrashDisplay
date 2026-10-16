@@ -99,3 +99,22 @@ day N acknowledged
 
 Nothing beyond the corner readings was verified on hardware; PlatformIO is
 not installed in the sandbox that produced these plans.
+
+## Implementation branches (2026-10-16)
+
+Each plan is implemented on its own branch, all based on commit 0ab0444
+(`touch-fix-test-hooks`: touch fix, serial test hooks, these plans). Each
+branch contains its own acknowledgement fix and the late-"Ja" guard. None has
+been compiled for the ESP32; each passed a host `g++ -std=gnu++11 -Wall`
+syntax check against the LVGL 9.2.2 headers with stand-in Arduino headers.
+
+| Plan | Branch | Commit | Extra test keys (besides h, 0, x, u) |
+|------|--------|--------|--------------------------------------|
+| A | `plan-a-particles` | 2864dfa | `c` replay the burst, `m` LVGL memory report |
+| B | `plan-b-done-overlay` | 98a66bd | `s` single hero without "Danach", `w` fetch window now |
+| C | `plan-c-hero-exit` | 06d689e | `1` one bar, `4` four bars |
+
+To test one: `git checkout <branch>`, then
+`pio run -e esp32-2432S028R-test -t upload && pio device monitor`. Press `x`
+between scenarios: on B and C the mark covers every earlier day, on A it is a
+set of up to four days.
