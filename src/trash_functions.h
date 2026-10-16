@@ -729,6 +729,9 @@ static void fetch_log_dump()
 static int32_t acked_day = -1;
 static const char *ack_path = "/ack.txt";
 
+// Not File::parseInt: the file has no trailing newline, and at its end
+// parseInt waits out Stream's 1 s timeout on every boot. Values <= 0 are
+// dropped, among them the "-1" an older build wrote for a late "Ja".
 static void ack_load()
 {
     File f = LittleFS.open(ack_path, "r");
@@ -736,8 +739,15 @@ static void ack_load()
     {
         return;
     }
-    long v = f.parseInt();
+    char buf[16];
+    size_t n = f.read((uint8_t *)buf, sizeof(buf) - 1);
     f.close();
+    if (n > sizeof(buf) - 1)
+    {
+        n = 0; // (size_t)-1 on a read error
+    }
+    buf[n] = 0;
+    long v = strtol(buf, NULL, 10);
     acked_day = (v > 0) ? (int32_t)v : -1;
     Serial.printf("ack loaded: day %ld\n", (long)acked_day);
 }

@@ -347,6 +347,14 @@ void update_display()
     {
         ack_clear(); // the acknowledged day rolled over on its own
     }
+    // a hero tap can only acknowledge a day within hero_from_days; a later day
+    // can only come from a corrupt file and, under the high-water rule in
+    // pickup_pending, would hide the whole calendar until it expired
+    if (acked_day > today + hero_from_days)
+    {
+        Serial.printf("ack day %ld lies beyond the hero window, cleared\n", (long)acked_day);
+        ack_clear();
+    }
 
     // next date per type under the rollover rule (pickup day counts until 10:00);
     // the acknowledged day and every earlier one count as collected
@@ -985,7 +993,8 @@ static bool had_valid_time = false;
 //   h  Gelber Sack tomorrow and Altpapier the day after: a hero, and after
 //      "Ja" the done card with "Danach: Altpapier übermorgen", then the next hero
 //   s  Gelber Sack tomorrow alone: a hero whose done card has no "Danach" line
-//   0  Restmüll today: a "HEUTE:" hero until the rollover hour
+//   0  Restmüll today: a "HEUTE:" hero; only before the rollover hour, later
+//      the key just says so
 //   x  lift the acknowledgement
 //   u  re-render (logs "render deferred" while the done card is up)
 //   w  start a fetch window now. The fetch drops injected dates of the current
@@ -1039,6 +1048,13 @@ static void test_hooks()
             Serial.println("test: Gelber Sack tomorrow");
             break;
         case '0':
+            if (t.tm_hour >= rollover_hour)
+            {
+                // the rollover rule hides today's pickup from this hour on
+                Serial.printf("test: it is past %02d:00, today's pickup would already be hidden; "
+                              "use 0 in the morning\n", rollover_hour);
+                continue;
+            }
             test_inject(REST, today);
             Serial.println("test: Restmüll today");
             break;
@@ -1129,7 +1145,10 @@ void loop()
         last_render_ms = now_ms;
     }
 
-    if (time_valid && now >= next_fetch_epoch)
+    // a fetch window blocks the loop for seconds and would freeze the done card
+    // mid-animation; a window that comes due while the card is up waits for
+    // the reveal, at most about 2.5 s
+    if (time_valid && now >= next_fetch_epoch && overlay_state == OV_IDLE)
     {
         setCpuFrequencyMhz(240); // TLS handshakes are sluggish at 80 MHz
         WiFi.mode(WIFI_STA);     // grey icon while associating

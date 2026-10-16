@@ -124,8 +124,9 @@ To try the touch flow without waiting for a pickup day, flash the test
 environment instead (`pio run -e esp32-2432S028R-test -t upload`) and type
 single keys in `pio device monitor`: `h` injects Gelber Sack tomorrow and
 Altpapier the day after (two heroes in a row), `s` injects Gelber Sack
-tomorrow alone, `0` injects Restmüll today, `x` lifts the acknowledgement,
-`u` re-renders, `w` starts a fetch window now. Injected dates live in RAM
+tomorrow alone, `0` injects Restmüll today (only before the 10:00 rollover;
+later the key just says so), `x` lifts the acknowledgement, `u` re-renders,
+`w` starts a fetch window now. Injected dates live in RAM
 only; the acknowledgement of an injected day is stored like any other, so end
 a test with `x`. A fetch drops injected dates of the current year; on 30 and
 31 December do not send `w` after `h` or `s`, since a date in the next year
