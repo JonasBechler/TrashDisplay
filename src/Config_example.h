@@ -23,7 +23,6 @@ static const char *addrPlz = "78464";
 
 // display behavior
 static const int rollover_hour = 10; // a pickup day leaves the screen at this hour
-static const int hero_from_days = 2; // hero mode from this many days before a pickup
 
 // fetch cadence (age-based, all in seconds)
 static const uint32_t refresh_interval_s = 7 * 24 * 3600; // normal re-fetch
@@ -36,5 +35,4 @@ static const uint32_t stale_red_age_s = 30 * 24 * 3600;   // the line turns red
 static const float brightness_threshold = 0.5;
 
 // touch
-static const uint32_t ack_dialog_timeout_s = 15; // an unanswered confirm dialog closes after this
-static const uint32_t touch_backlight_s = 20;    // a touch keeps the backlight on this long in a dark room
+static const uint32_t touch_backlight_s = 20; // a touch keeps the backlight on this long in a dark room

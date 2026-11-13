@@ -10,7 +10,6 @@
 LV_FONT_DECLARE(montserrat_de_16);
 LV_FONT_DECLARE(montserrat_de_20);
 LV_FONT_DECLARE(montserrat_de_32);
-LV_FONT_DECLARE(symbol_check_48); // LV_SYMBOL_OK only, for the done overlay
 
 static lv_obj_t *content; // rebuilt on every render
 static lv_obj_t *wifi_label;
@@ -19,47 +18,37 @@ static lv_obj_t *ack_label; // "Erledigt: <date>" while a pickup day is acknowle
 static int wifi_icon_state = -1;
 static int32_t shown_hero_day = -1; // pickup day of the hero on screen, -1 in every other mode
 
-// touch: confirm dialog on the top layer, built once and shown on demand
-static lv_obj_t *dialog;
-static lv_obj_t *dialog_title;
-static lv_obj_t *dialog_text;
-static lv_timer_t *dialog_timer; // closes an unanswered dialog
-static int32_t dialog_day = -1;  // pickup day the open dialog is about
-static bool dialog_undo = false; // true: the dialog offers to lift an acknowledgement
 static lv_indev_t *touch_indev = NULL;
 static uint32_t touch_wake_until_ms = 0; // backlight forced on until then after a touch
 
-// done overlay: green "Erledigt" card on the top layer after "Ja", built once.
-// STAMP: the circle pops; HOLD: static card; REVEAL: card gone, content rebuilt,
-// the veil fades out. Timings live here, not in Config.h, so existing Config.h
-// files keep compiling.
-enum OverlayState : uint8_t
-{
-    OV_IDLE,
-    OV_STAMP,
-    OV_HOLD,
-    OV_REVEAL
-};
-static OverlayState overlay_state = OV_IDLE;
-static uint32_t overlay_shown_ms = 0; // millis() of the "Ja" that opened the overlay
-static lv_obj_t *overlay;             // full-screen backdrop, absorbs every tap while up
-static lv_obj_t *overlay_card;
-static lv_obj_t *overlay_circle;
-static lv_obj_t *overlay_check;
-static lv_obj_t *overlay_types;
-static lv_obj_t *overlay_hint;
-static lv_timer_t *overlay_timer; // ends the hold
-static const uint32_t ov_pop_delay_ms = 80; // lets the full-screen dialog-to-card frame finish first
-static const uint32_t ov_pop_ms = 300;
-static const uint32_t ov_min_ms = 400; // taps before this are the release bounce of "Ja"
-static const uint32_t ov_hold_ms = 1800;
-static const uint32_t ov_fade_ms = 320;
-static const uint32_t ov_stuck_ms = 10000; // update_display stops deferring after this
-static const int32_t ov_circle = 76;       // final circle diameter in px
+// undo: after "Erledigt" the hero stays up in its done state for undo_window_s,
+// its button turned into "Rückgängig". Afterwards the mark is final until the
+// day's rollover. Lives here, not in Config.h, so existing Config.h files keep
+// compiling.
+static const uint32_t undo_window_s = 30;
+static int32_t undo_day = -1;        // day marked by the last "Erledigt" tap, -1 without an undo window
+static int32_t undo_prev_ack = -1;   // acked_day before that tap; undo restores it
+static uint32_t undo_start_ms = 0;   // millis() of the tap
+static lv_timer_t *undo_timer;       // one tick per second: countdown, then the window closes
+static lv_obj_t *undo_count = NULL;  // countdown label inside the hero, NULL while not on screen
+static uint32_t undo_lifted_ms = 0;  // millis() of the last "Rückgängig"
+static bool celebrate = false;       // the next done render plays the in-place celebration
+static const uint32_t bounce_ms = 400; // a tap this soon after a toggle is the release bounce
+static const int32_t hero_button_h = 46;
+
+// in-place celebration: the done hero is built right away, undo button included,
+// and only small parts animate: a check circle pops in the header, the bars fade
+// to their dimmed color. No overlay, nothing between the tap and the undo.
+static const uint32_t cel_pop_ms = 320;
+static const uint32_t cel_dim_ms = 360;
+static const int32_t cel_circle = 26;               // final circle diameter in px
+static const int32_t cel_cx = 19, cel_cy = 18;      // circle centre in the header row
+static const uint8_t bar_dim_mix = 90;              // done bar: this much of the bin color, rest black
 
 void update_display();
-static void overlay_show(int32_t day);
-static void overlay_finish();
+static void on_done_clicked(lv_event_t *e);
+static void on_undo_clicked(lv_event_t *e);
+static void undo_update_count();
 
 static const char *weekday_abbrev[7] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
 
@@ -108,6 +97,8 @@ void update_wifi_icon()
     }
 }
 
+#include "celebrations.h" // after type_color
+
 static void format_date(char *buf, size_t n, int32_t day)
 {
     struct tm t;
@@ -155,13 +146,13 @@ static void make_type_row(int y, int h, uint8_t type, int32_t next_day, int32_t 
         char date[32];
         format_date(date, sizeof(date), next_day);
         int delta = (int)(next_day - today);
-        if (delta == 1)
+        if (delta == 0)
+        {
+            snprintf(buf, sizeof(buf), "%s  heute", date);
+        }
+        else if (delta == 1)
         {
             snprintf(buf, sizeof(buf), "%s  morgen", date);
-        }
-        else if (delta == 2)
-        {
-            snprintf(buf, sizeof(buf), "%s  übermorgen", date);
         }
         else
         {
@@ -182,89 +173,45 @@ static lv_obj_t *make_header(const char *text, lv_color_t color)
     return h;
 }
 
-static_assert(hero_from_days <= 2, "render_hero's headers cover today, tomorrow and the day after");
-
-// hero mode: every type due on next_day gets a full-width colored bar
-static void render_hero(int32_t next_day, int delta, const int32_t next_of_type[TYPE_COUNT],
-                        int32_t today)
+// grows the header circle around its centre; the check fades in once it fits
+static void cel_pop_exec(void *var, int32_t v)
 {
-    if (delta == 0)
-    {
-        make_header("HEUTE:", lv_color_hex(0xEF5350));
-    }
-    else if (delta == 1)
-    {
-        make_header("Für morgen rausstellen:", lv_color_hex(0xFFA726));
-    }
-    else
-    {
-        make_header("Übermorgen:", lv_color_hex(0xE0E0E0));
-    }
-
-    int nb = 0;
-    for (int t = 0; t < TYPE_COUNT; t++)
-    {
-        if (next_of_type[t] == next_day)
-        {
-            nb++;
-        }
-    }
-    int bar_h = (nb <= 1) ? 54 : (nb == 2) ? 44 : (nb == 3) ? 34 : 28;
-    const lv_font_t *bar_font = (nb <= 2) ? &montserrat_de_32 : &montserrat_de_20;
-
-    int y = 34;
-    for (int t = 0; t < TYPE_COUNT; t++)
-    {
-        if (next_of_type[t] != next_day)
-        {
-            continue;
-        }
-        lv_obj_t *bar = lv_obj_create(content);
-        lv_obj_set_size(bar, 312, bar_h);
-        lv_obj_set_pos(bar, 4, y);
-        lv_obj_set_style_bg_color(bar, type_color(t), 0);
-        lv_obj_set_style_border_width(bar, 0, 0);
-        lv_obj_set_style_radius(bar, 6, 0);
-        lv_obj_set_style_pad_all(bar, 0, 0);
-        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_t *name = lv_label_create(bar);
-        lv_obj_set_style_text_font(name, bar_font, 0);
-        lv_obj_set_style_text_color(name, (t == GELB) ? lv_color_black() : lv_color_white(), 0);
-        lv_label_set_text(name, type_display_name[t]);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 12, 0);
-        y += bar_h + 6;
-    }
-
-    char date[32];
-    format_date(date, sizeof(date), next_day);
-    lv_obj_t *dl = lv_label_create(content);
-    lv_obj_set_style_text_font(dl, &montserrat_de_16, 0);
-    lv_obj_set_style_text_color(dl, lv_color_hex(0x9E9E9E), 0);
-    lv_label_set_text(dl, date);
-    lv_obj_set_pos(dl, 4, y + 2); // right edge at 312, flush with the countdown column
-    lv_obj_set_width(dl, 308);
-    lv_obj_set_style_text_align(dl, LV_TEXT_ALIGN_RIGHT, 0);
-
-    y += 28;
-    for (int t = 0; t < TYPE_COUNT; t++)
-    {
-        if (next_of_type[t] == next_day)
-        {
-            continue;
-        }
-        make_type_row(y, 26, t, next_of_type[t], today, &montserrat_de_16);
-        y += 28;
-    }
+    lv_obj_t *circle = (lv_obj_t *)var;
+    lv_obj_set_size(circle, v, v);
+    lv_obj_set_pos(circle, cel_cx - v / 2, cel_cy - v / 2);
+    int32_t o = (v - 14) * 255 / 10;
+    lv_obj_set_style_text_opa(lv_obj_get_child(circle, 0), (lv_opa_t)LV_CLAMP(0, o, 255), 0);
 }
 
-// quiet mode: one row per type, sorted by next date, types without a date last
-static void render_list(const int32_t next_of_type[TYPE_COUNT], int32_t today)
+// v 0..255: bin color to its dimmed color, name to grey. bg_color and
+// text_color only: opa or transforms would render the 312 px bars through layers
+static void cel_dim_exec(void *var, int32_t v)
 {
-    make_header("Abfuhrtermine", lv_color_hex(0xBDBDBD));
+    lv_obj_t *bar = (lv_obj_t *)var;
+    uint8_t t = (uint8_t)(uintptr_t)lv_obj_get_user_data(bar);
+    lv_color_t full = type_color(t);
+    lv_color_t dim = lv_color_mix(full, lv_color_black(), bar_dim_mix);
+    lv_obj_set_style_bg_color(bar, lv_color_mix(dim, full, (uint8_t)v), 0);
+    lv_color_t fg = (t == GELB) ? lv_color_black() : lv_color_white();
+    lv_obj_set_style_text_color(lv_obj_get_child(bar, 0), lv_color_mix(lv_color_hex(0xBDBDBD), fg, (uint8_t)v), 0);
+}
 
-    uint8_t order[TYPE_COUNT];
+static void start_anim(void *var, lv_anim_exec_xcb_t cb, int32_t from, int32_t to, uint32_t ms,
+                       lv_anim_path_cb_t path)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, var);
+    lv_anim_set_exec_cb(&a, cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, ms);
+    lv_anim_set_path_cb(&a, path);
+    lv_anim_start(&a); // early_apply: the first frame already shows the start value
+}
+
+// type indices sorted by next date, types without a date last
+static void types_by_date(const int32_t next_of_type[TYPE_COUNT], uint8_t order[TYPE_COUNT])
+{
     int n = 0;
     for (int t = 0; t < TYPE_COUNT; t++)
     {
@@ -288,9 +235,189 @@ static void render_list(const int32_t next_of_type[TYPE_COUNT], int32_t today)
         }
         order[j + 1] = key;
     }
+}
+
+// symbol in the built-in font (the umlaut fonts carry no symbols), text in montserrat_de_20
+static lv_obj_t *make_hero_button(int y, lv_color_t bg, const char *symbol, const char *text,
+                                  lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_button_create(content);
+    lv_obj_set_size(btn, 312, hero_button_h);
+    lv_obj_set_pos(btn, 4, y);
+    lv_obj_set_style_bg_color(btn, bg, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_set_style_pad_column(btn, 10, 0);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *sym = lv_label_create(btn);
+    lv_obj_set_style_text_font(sym, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(sym, lv_color_white(), 0);
+    lv_label_set_text(sym, symbol);
+
+    lv_obj_t *l = lv_label_create(btn);
+    lv_obj_set_style_text_font(l, &montserrat_de_20, 0);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_label_set_text(l, text);
+    return btn;
+}
+
+// Hero mode, only for tomorrow's pickup: one full-width colored bar per bin due on
+// day, below them the button, below that the other types compact. done: the day
+// was just marked; bars dimmed, the button offers the undo with a countdown.
+// The button sits between y 90 and 202, inside the band the uncalibrated panel
+// reaches (it stops about 30 px short of each edge, see the touch notes).
+static void render_hero(int32_t day, const int32_t next_of_type[TYPE_COUNT], int32_t today, bool done)
+{
+    bool on_day[TYPE_COUNT] = {false, false, false, false};
+    int nb = 0;
+    for (int i = 0; i < pickup_count; i++)
+    {
+        if (pickups[i].day == day && !on_day[pickups[i].type])
+        {
+            on_day[pickups[i].type] = true;
+            nb++;
+        }
+    }
+
+    bool animate = done && celebrate;
+    celebrate = false; // later renders of the window (minute tick) show the end state
+    lv_obj_t *header = make_header(done ? "Erledigt" : "Morgen rausstellen",
+                                   done ? lv_color_hex(0x66BB6A) : lv_color_hex(0xFFA726));
+    if (done)
+    {
+        // white circle with a green check left of the header text
+        lv_obj_set_pos(header, 40, 6);
+        lv_obj_t *circle = lv_obj_create(content);
+        lv_obj_set_size(circle, cel_circle, cel_circle);
+        lv_obj_set_pos(circle, cel_cx - cel_circle / 2, cel_cy - cel_circle / 2);
+        lv_obj_set_style_bg_color(circle, lv_color_white(), 0);
+        lv_obj_set_style_border_width(circle, 0, 0);
+        lv_obj_set_style_radius(circle, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_all(circle, 0, 0);
+        lv_obj_clear_flag(circle, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(circle, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *check = lv_label_create(circle);
+        lv_obj_set_style_text_font(check, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(check, lv_color_hex(0x2E7D32), 0);
+        lv_label_set_text(check, LV_SYMBOL_OK);
+        lv_obj_center(check);
+        if (animate)
+        {
+            start_anim(circle, cel_pop_exec, 4, cel_circle, cel_pop_ms, lv_anim_path_overshoot);
+        }
+    }
+
+    // date in the header row; right edge at 292 keeps the WiFi icon's corner free
+    char date[32];
+    format_date(date, sizeof(date), day);
+    lv_obj_t *dl = lv_label_create(content);
+    lv_obj_set_style_text_font(dl, &montserrat_de_16, 0);
+    lv_obj_set_style_text_color(dl, lv_color_hex(0x9E9E9E), 0);
+    lv_label_set_text(dl, date);
+    lv_obj_set_width(dl, 120);
+    lv_obj_set_style_text_align(dl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(dl, 172, 9);
+
+    // sized so header, bars, button and the remaining rows always fit in 222 px
+    int bar_h = (nb <= 1) ? 50 : (nb == 2) ? 38 : (nb == 3) ? 30 : 26;
+    const lv_font_t *bar_font = (nb <= 2) ? &montserrat_de_32 : &montserrat_de_20;
+
+    int y = 34;
+    for (int t = 0; t < TYPE_COUNT; t++)
+    {
+        if (!on_day[t])
+        {
+            continue;
+        }
+        lv_obj_t *bar = lv_obj_create(content);
+        lv_obj_set_size(bar, 312, bar_h);
+        lv_obj_set_pos(bar, 4, y);
+        // done: the bin color mixed toward black, plain bg_color, no opa layer
+        lv_obj_set_style_bg_color(bar, done ? lv_color_mix(type_color(t), lv_color_black(), bar_dim_mix) : type_color(t), 0);
+        lv_obj_set_user_data(bar, (void *)(uintptr_t)t);
+        lv_obj_set_style_border_width(bar, 0, 0);
+        lv_obj_set_style_radius(bar, 6, 0);
+        lv_obj_set_style_pad_all(bar, 0, 0);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *name = lv_label_create(bar);
+        lv_obj_set_style_text_font(name, bar_font, 0);
+        lv_color_t fg = (t == GELB) ? lv_color_black() : lv_color_white();
+        lv_obj_set_style_text_color(name, done ? lv_color_hex(0xBDBDBD) : fg, 0);
+        lv_label_set_text(name, type_display_name[t]);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 12, 0);
+        if (animate)
+        {
+            start_anim(bar, cel_dim_exec, 0, 255, cel_dim_ms, lv_anim_path_ease_out);
+        }
+        y += bar_h + 4;
+    }
+
+    if (animate)
+    {
+        // a random particle celebration over the whole screen; never clickable,
+        // so the undo button below keeps working while it runs
+        lv_color_t bins[TYPE_COUNT];
+        int n = 0;
+        for (int t = 0; t < TYPE_COUNT; t++)
+        {
+            if (on_day[t])
+            {
+                bins[n++] = type_color(t);
+            }
+        }
+        lv_area_t spawn = {4, 34, 315, y - 5};
+        celebration_start(spawn, bins, n);
+    }
+
+    y += 2;
+    if (done)
+    {
+        lv_obj_t *btn = make_hero_button(y, lv_color_hex(0x546E7A), LV_SYMBOL_REFRESH, "Rückgängig",
+                                         on_undo_clicked);
+        undo_count = lv_label_create(btn);
+        lv_obj_set_style_text_font(undo_count, &montserrat_de_16, 0);
+        lv_obj_set_style_text_color(undo_count, lv_color_hex(0xCFD8DC), 0);
+        // fixed width: the countdown redraws only this label, never reflows the row
+        lv_obj_set_width(undo_count, 40);
+        undo_update_count();
+    }
+    else
+    {
+        make_hero_button(y, lv_color_hex(0x43A047), LV_SYMBOL_OK, "Erledigt", on_done_clicked);
+    }
+    y += hero_button_h + 6;
+
+    uint8_t order[TYPE_COUNT];
+    types_by_date(next_of_type, order); // nearest first, as in the list
+    for (int i = 0; i < TYPE_COUNT; i++)
+    {
+        uint8_t t = order[i];
+        if (on_day[t])
+        {
+            continue;
+        }
+        make_type_row(y, 24, t, next_of_type[t], today, &montserrat_de_16);
+        y += 26;
+    }
+}
+
+// quiet mode: one row per type, sorted by next date, types without a date last
+static void render_list(const int32_t next_of_type[TYPE_COUNT], int32_t today)
+{
+    make_header("Abfuhrtermine", lv_color_hex(0xBDBDBD));
+
+    uint8_t order[TYPE_COUNT];
+    types_by_date(next_of_type, order);
 
     int y = 40;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < TYPE_COUNT; i++)
     {
         make_type_row(y, 42, order[i], next_of_type[order[i]], today, &montserrat_de_20);
         y += 46;
@@ -315,22 +442,9 @@ static void render_center_message(const char *big, const char *small)
 
 void update_display()
 {
-    // The done card refers to the hero underneath: rebuilding now would put the next
-    // hero ("Übermorgen: Restmüll") under an "Erledigt" stamp. The reveal re-renders
-    // by itself. Bounded, so a stuck overlay can never freeze the calendar.
-    if (overlay_state == OV_STAMP || overlay_state == OV_HOLD)
-    {
-        if (millis() - overlay_shown_ms < ov_stuck_ms)
-        {
-            Serial.println("render deferred: done overlay up");
-            return;
-        }
-        Serial.println("done overlay stuck, closing it");
-        overlay_finish();
-    }
-
     lv_obj_clean(content);
     shown_hero_day = -1;
+    undo_count = NULL; // deleted with the content
 
     time_t now = time(NULL);
     if (now < min_valid_epoch)
@@ -347,10 +461,10 @@ void update_display()
     {
         ack_clear(); // the acknowledged day rolled over on its own
     }
-    // a hero tap can only acknowledge a day within hero_from_days; a later day
-    // can only come from a corrupt file and, under the high-water rule in
-    // pickup_pending, would hide the whole calendar until it expired
-    if (acked_day > today + hero_from_days)
+    // the hero button can only acknowledge tomorrow; a later day can only come
+    // from a corrupt file and, under the high-water rule in pickup_pending, would
+    // hide the whole calendar until it expired
+    if (acked_day > today + 1)
     {
         Serial.printf("ack day %ld lies beyond the hero window, cleared\n", (long)acked_day);
         ack_clear();
@@ -381,7 +495,20 @@ void update_display()
         }
     }
 
-    if (next_day < 0)
+    // the mark of the undo window was lifted elsewhere (rollover, corrupt-file
+    // check, test key): nothing left to undo
+    if (undo_day >= 0 && acked_day != undo_day)
+    {
+        undo_day = -1;
+        lv_timer_pause(undo_timer);
+    }
+
+    if (undo_day >= 0)
+    {
+        render_hero(undo_day, next_of_type, today, true);
+        shown_hero_day = undo_day;
+    }
+    else if (next_day < 0)
     {
         if (pickup_count == 0 && last_outcome != FO_NO_FILE)
         {
@@ -403,9 +530,9 @@ void update_display()
             render_center_message(buf, sub);
         }
     }
-    else if (next_day - today <= hero_from_days)
+    else if (next_day - today == 1)
     {
-        render_hero(next_day, (int)(next_day - today), next_of_type, today);
+        render_hero(next_day, next_of_type, today, false);
         shown_hero_day = next_day;
     }
     else
@@ -431,8 +558,8 @@ void update_display()
         lv_obj_add_flag(stale_label, LV_OBJ_FLAG_HIDDEN);
     }
 
-    // acknowledgement hint; with no hero on screen a tap then offers to lift it
-    if (acked_day >= 0)
+    // acknowledgement hint; the done hero of the undo window says it already
+    if (acked_day >= 0 && undo_day < 0)
     {
         char date[32];
         format_date(date, sizeof(date), acked_day);
@@ -459,8 +586,8 @@ void update_display()
 // 29,205 and the top-right corner made LVGL warn "Y is -48 which is smaller
 // than zero". Without it the corners measured 36,33 / 287,31 / 290,210 /
 // 32,212 clockwise from top-left (see on_touch_pressed): the uncalibrated
-// panel stays about 30 px short of the edges, fine for the centred dialog
-// buttons. A press on the very edge can still make LVGL warn "Y is -1": the
+// panel stays about 30 px short of the edges, fine for the full-width hero
+// button. A press on the very edge can still make LVGL warn "Y is -1": the
 // driver mirrors X as x_max - x, one pixel past the edge, and LVGL clamps it.
 
 // every press wakes the backlight and logs the mapped point for a mapping check
@@ -484,453 +611,113 @@ static void setup_touch()
 }
 
 
-// ---------------------------------------------------------------- confirm dialog
+// ---------------------------------------------------------------- done and undo
 
-static void dialog_close()
+static uint32_t undo_remaining_s()
 {
-    lv_obj_add_flag(dialog, LV_OBJ_FLAG_HIDDEN);
-    lv_timer_pause(dialog_timer);
-    dialog_day = -1;
+    uint32_t elapsed_s = (millis() - undo_start_ms) / 1000;
+    return (elapsed_s >= undo_window_s) ? 0 : undo_window_s - elapsed_s;
 }
 
-static void on_dialog_timeout(lv_timer_t *t)
+static void undo_update_count()
 {
-    dialog_close();
-}
-
-static void on_dialog_no(lv_event_t *e)
-{
-    dialog_close();
-}
-
-static void on_dialog_yes(lv_event_t *e)
-{
-    // A "Ja" still held when the timeout closes the dialog is clicked on release
-    // anyway: LVGL keeps a press-locked object pressed and sends CLICKED without
-    // checking HIDDEN. dialog_day is -1 by then; ack_set(-1) would lift the mark.
-    if (dialog_day < 0)
+    if (undo_count == NULL)
     {
-        Serial.println("late Ja after dialog timeout ignored");
         return;
     }
-    if (dialog_undo)
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu s", (unsigned long)undo_remaining_s());
+    lv_label_set_text(undo_count, buf);
+}
+
+// Called from a button's own CLICKED handler: rebuilding the content there would
+// delete the object whose event is still being dispatched, so the render runs
+// from the next lv_timer_handler pass instead.
+static void render_async(void *unused)
+{
+    update_display();
+}
+
+static void on_undo_tick(lv_timer_t *t)
+{
+    if (undo_day < 0)
     {
-        struct tm t;
-        int32_t today = today_day(&t);
-        ack_step_back(today, t.tm_hour);
-        Serial.printf("acknowledgement of day %ld lifted, now up to day %ld\n", (long)dialog_day,
-                      (long)acked_day);
-        dialog_close();
-        update_display();
+        lv_timer_pause(undo_timer);
         return;
     }
-    int32_t day = dialog_day;
-    Serial.printf("day %ld acknowledged\n", (long)day);
+    if (undo_remaining_s() > 0)
+    {
+        undo_update_count();
+        return;
+    }
+    Serial.printf("undo window for day %ld closed\n", (long)undo_day);
+    undo_day = -1;
+    lv_timer_pause(undo_timer);
+    update_display(); // the done hero gives way to the list
+}
+
+// "Erledigt" on the hero: marks the day at once, no confirm step. The next render
+// shows the done hero, with "Rückgängig" in the same spot from the first frame,
+// and celebrates in place.
+static void on_done_clicked(lv_event_t *e)
+{
+    int32_t day = shown_hero_day;
+    if (day < 0 || undo_day >= 0)
+    {
+        return; // stale button of an older render
+    }
+    if (millis() - undo_lifted_ms < bounce_ms)
+    {
+        return; // bounce of the "Rückgängig" that just brought this button back
+    }
+    undo_prev_ack = acked_day;
+    undo_day = day;
+    undo_start_ms = millis();
+    lv_timer_reset(undo_timer);
+    lv_timer_resume(undo_timer);
     ack_set(day);
-    // dialog out and card in within one handler: no frame shows the bright hero
-    // between them; the content behind is rebuilt at the reveal
-    dialog_close();
-    overlay_show(day);
+    Serial.printf("day %ld acknowledged, undo for %lu s\n", (long)day, (unsigned long)undo_window_s);
+    celebrate = true;
+    lv_async_call(render_async, NULL);
 }
 
-// comma-separated display names of the types due on day
-static void types_due_on(int32_t day, char *buf, size_t n)
+// "Rückgängig" within the window: the mark goes back to what it was before the tap
+static void on_undo_clicked(lv_event_t *e)
 {
-    buf[0] = 0;
-    for (int i = 0; i < pickup_count; i++)
+    if (undo_day < 0)
     {
-        if (pickups[i].day != day)
+        return; // the window closed while the finger was down
+    }
+    if (millis() - undo_start_ms < bounce_ms)
+    {
+        return; // bounce of the "Erledigt" tap; the undo button took its place
+    }
+    Serial.printf("acknowledgement of day %ld undone after %lu ms\n", (long)undo_day,
+                  (unsigned long)(millis() - undo_start_ms));
+    if (acked_day == undo_day)
+    {
+        if (undo_prev_ack >= 0)
         {
-            continue;
+            ack_set(undo_prev_ack); // update_display drops it if it rolled over meanwhile
         }
-        if (buf[0] != 0)
+        else
         {
-            strlcat(buf, ", ", n);
+            ack_clear();
         }
-        strlcat(buf, type_display_name[pickups[i].type], n);
     }
-    if (buf[0] == 0)
-    {
-        strlcpy(buf, "Abfuhr", n); // day no longer in the calendar (undo after a refresh)
-    }
+    celebration_stop();
+    undo_day = -1;
+    undo_lifted_ms = millis();
+    lv_timer_pause(undo_timer);
+    lv_async_call(render_async, NULL);
 }
 
-static void dialog_open(int32_t day, bool undo)
+static void setup_undo()
 {
-    dialog_day = day;
-    dialog_undo = undo;
-    char types[64];
-    types_due_on(day, types, sizeof(types));
-    char date[32];
-    format_date(date, sizeof(date), day);
-    char buf[128];
-    if (undo)
-    {
-        lv_label_set_text(dialog_title, "Markierung aufheben?");
-        snprintf(buf, sizeof(buf), "%s am %s wieder anzeigen", types, date);
-    }
-    else
-    {
-        lv_label_set_text(dialog_title, "Als erledigt markieren?");
-        snprintf(buf, sizeof(buf), "%s am %s", types, date);
-    }
-    lv_label_set_text(dialog_text, buf);
-    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_HIDDEN);
-    lv_timer_reset(dialog_timer);
-    lv_timer_resume(dialog_timer);
+    undo_timer = lv_timer_create(on_undo_tick, 1000, NULL);
+    lv_timer_pause(undo_timer);
 }
 
-// A tap on the hero offers to mark that pickup day as handled. With no hero on
-// screen and an acknowledgement still active it offers to lift the
-// acknowledgement. In every other state a tap does nothing.
-static void on_screen_clicked(lv_event_t *e)
-{
-    if (time(NULL) < min_valid_epoch)
-    {
-        return;
-    }
-    if (shown_hero_day >= 0)
-    {
-        dialog_open(shown_hero_day, false);
-        return;
-    }
-    struct tm t;
-    int32_t today = today_day(&t);
-    if (ack_active(today, t.tm_hour))
-    {
-        dialog_open(acked_day, true);
-    }
-}
-
-static void make_dialog_button(lv_obj_t *parent, const char *text, lv_color_t bg,
-                               lv_align_t align, lv_event_cb_t cb)
-{
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_size(btn, 130, 56);
-    lv_obj_align(btn, align, 0, 0);
-    lv_obj_set_style_bg_color(btn, bg, 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *l = lv_label_create(btn);
-    lv_obj_set_style_text_font(l, &montserrat_de_20, 0);
-    lv_obj_set_style_text_color(l, lv_color_white(), 0);
-    lv_label_set_text(l, text);
-    lv_obj_center(l);
-}
-
-// Big targets in the middle of the screen: the resistive panel is uncalibrated
-// and a wrongly mapped tap should land on the backdrop (cancel) rather than on
-// the other button.
-static void setup_dialog()
-{
-    // full-screen backdrop on the top layer; a tap on it cancels
-    dialog = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(dialog, 320, 240);
-    lv_obj_set_pos(dialog, 0, 0);
-    lv_obj_set_style_bg_color(dialog, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(dialog, LV_OPA_70, 0);
-    lv_obj_set_style_border_width(dialog, 0, 0);
-    lv_obj_set_style_radius(dialog, 0, 0);
-    lv_obj_set_style_pad_all(dialog, 0, 0);
-    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(dialog, on_dialog_no, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_flag(dialog, LV_OBJ_FLAG_HIDDEN);
-
-    // the card stays clickable so a tap on it neither cancels nor falls through
-    lv_obj_t *card = lv_obj_create(dialog);
-    lv_obj_set_size(card, 296, 192);
-    lv_obj_center(card);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x263238), 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_radius(card, 10, 0);
-    lv_obj_set_style_pad_all(card, 12, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    dialog_title = lv_label_create(card);
-    lv_obj_set_style_text_font(dialog_title, &montserrat_de_20, 0);
-    lv_obj_set_style_text_color(dialog_title, lv_color_white(), 0);
-    lv_obj_align(dialog_title, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    dialog_text = lv_label_create(card);
-    lv_obj_set_style_text_font(dialog_text, &montserrat_de_16, 0);
-    lv_obj_set_style_text_color(dialog_text, lv_color_hex(0xB0BEC5), 0);
-    lv_obj_set_width(dialog_text, 272);
-    lv_label_set_long_mode(dialog_text, LV_LABEL_LONG_WRAP);
-    lv_obj_align(dialog_text, LV_ALIGN_TOP_LEFT, 0, 30);
-
-    make_dialog_button(card, "Ja", lv_color_hex(0x43A047), LV_ALIGN_BOTTOM_LEFT, on_dialog_yes);
-    make_dialog_button(card, "Nein", lv_color_hex(0x546E7A), LV_ALIGN_BOTTOM_RIGHT, on_dialog_no);
-
-    dialog_timer = lv_timer_create(on_dialog_timeout, ack_dialog_timeout_s * 1000, NULL);
-    lv_timer_pause(dialog_timer);
-}
-
-
-// ---------------------------------------------------------------- done overlay
-
-// The panel renders into one partial buffer and flushes it before the next chunk,
-// so a full-screen frame costs over 50 ms of SPI. Only small areas animate (the
-// circle), and nothing here uses opa, transforms or clip_corner: those render
-// through ARGB layers that a 296 px card would not fit into in the 64 KB pool.
-// bg_opa, text_opa and size need no layer.
-
-#ifdef TEST_HOOKS
-static uint32_t overlay_frames = 0; // frames rendered since the overlay was shown
-
-static void on_render_ready(lv_event_t *e)
-{
-    overlay_frames++;
-}
-#endif
-
-// "Danach: Restmüll übermorgen" when the view after the reveal is another hero,
-// empty otherwise. Call after ack_set, so the acknowledged day no longer counts.
-static void next_hero_hint(char *buf, size_t n)
-{
-    buf[0] = 0;
-    struct tm t;
-    int32_t today = today_day(&t);
-    for (int i = 0; i < pickup_count; i++) // sorted ascending: the first pending day is the next hero
-    {
-        int32_t d = pickups[i].day;
-        if (!pickup_pending(d, today, t.tm_hour))
-        {
-            continue;
-        }
-        int delta = (int)(d - today);
-        if (delta <= hero_from_days)
-        {
-            char types[64];
-            types_due_on(d, types, sizeof(types));
-            const char *when = (delta == 0) ? "heute" : (delta == 1) ? "morgen" : "übermorgen";
-            snprintf(buf, n, "Danach: %s %s", types, when);
-        }
-        return;
-    }
-}
-
-// grows the circle around its centre; the glyph fades in once the circle can hold it
-// (children clip to the parent's rectangle, so a half-grown circle would cut it square)
-static void overlay_pop_exec(void *var, int32_t v)
-{
-    lv_obj_t *circle = (lv_obj_t *)var;
-    lv_obj_set_size(circle, v, v);
-    lv_obj_align(circle, LV_ALIGN_LEFT_MID, 8 + (ov_circle - v) / 2, 0);
-    int32_t o = (v - 40) * 255 / 24;
-    lv_obj_set_style_text_opa(overlay_check, (lv_opa_t)LV_CLAMP(0, o, 255), 0);
-}
-
-static void overlay_fade_exec(void *var, int32_t v)
-{
-    lv_obj_set_style_bg_opa((lv_obj_t *)var, (lv_opa_t)v, 0); // bg_opa: no layer, unlike opa
-}
-
-static void on_overlay_popped(lv_anim_t *a)
-{
-    if (overlay_state == OV_STAMP)
-    {
-        overlay_state = OV_HOLD;
-    }
-}
-
-static void overlay_finish()
-{
-    lv_timer_pause(overlay_timer);
-    lv_anim_delete(overlay_circle, NULL);
-    lv_anim_delete(overlay, NULL); // safe from the fade's own completed_cb: already unlinked
-    lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-    overlay_state = OV_IDLE;
-#ifdef TEST_HOOKS
-    Serial.printf("overlay idle after %lu ms, %lu frames\n", (unsigned long)(millis() - overlay_shown_ms),
-                  (unsigned long)overlay_frames);
-#else
-    Serial.printf("overlay idle after %lu ms\n", (unsigned long)(millis() - overlay_shown_ms));
-#endif
-}
-
-static void on_overlay_faded(lv_anim_t *a)
-{
-    overlay_finish();
-}
-
-static void overlay_reveal(const char *why)
-{
-    if (overlay_state != OV_STAMP && overlay_state != OV_HOLD)
-    {
-        return; // late timer or tap after a forced close, or already revealing
-    }
-    lv_timer_pause(overlay_timer);
-    lv_anim_delete(overlay_circle, overlay_pop_exec); // a tap can cut the pop short
-    lv_obj_add_flag(overlay_card, LV_OBJ_FLAG_HIDDEN);
-    overlay_state = OV_REVEAL; // before update_display(): the deferral no longer applies
-    update_display();          // the next view is built in the frame the card leaves
-    Serial.printf("overlay reveal (%s) after %lu ms\n", why, (unsigned long)(millis() - overlay_shown_ms));
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, overlay);
-    lv_anim_set_exec_cb(&a, overlay_fade_exec);
-    lv_anim_set_values(&a, LV_OPA_70, LV_OPA_TRANSP);
-    lv_anim_set_duration(&a, ov_fade_ms);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_completed_cb(&a, on_overlay_faded);
-    lv_anim_start(&a);
-}
-
-static void on_overlay_timer(lv_timer_t *t)
-{
-    overlay_reveal("timer");
-}
-
-static void on_overlay_clicked(lv_event_t *e)
-{
-    // absorbs every tap; only one after ov_min_ms (not the bounce of "Ja") skips the hold
-    if (millis() - overlay_shown_ms >= ov_min_ms)
-    {
-        overlay_reveal("tap");
-    }
-}
-
-static void overlay_show(int32_t day)
-{
-    char types[64];
-    types_due_on(day, types, sizeof(types));
-    lv_label_set_text(overlay_types, types);
-    char hint[112];
-    next_hero_hint(hint, sizeof(hint));
-    if (hint[0] != 0)
-    {
-        lv_label_set_text(overlay_hint, hint);
-        lv_obj_clear_flag(overlay_hint, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        lv_obj_add_flag(overlay_hint, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0); // the last fade left it transparent
-    lv_obj_clear_flag(overlay_card, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-    overlay_state = OV_STAMP;
-    overlay_shown_ms = millis();
-#ifdef TEST_HOOKS
-    overlay_frames = 0;
-#endif
-
-    // early_apply (the lv_anim_init default) sets the 20 px start size right away,
-    // so the first card frame already shows the small circle
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, overlay_circle);
-    lv_anim_set_exec_cb(&a, overlay_pop_exec);
-    lv_anim_set_values(&a, 20, ov_circle);
-    lv_anim_set_delay(&a, ov_pop_delay_ms);
-    lv_anim_set_duration(&a, ov_pop_ms);
-    lv_anim_set_path_cb(&a, lv_anim_path_overshoot); // peaks near 78 px
-    lv_anim_set_completed_cb(&a, on_overlay_popped);
-    lv_anim_start(&a);
-
-    lv_timer_reset(overlay_timer);
-    lv_timer_resume(overlay_timer);
-
-    lv_mem_monitor_t mon;
-    lv_mem_monitor(&mon);
-    Serial.printf("overlay show: day %ld, hint '%s', lv heap free %u, biggest %u\n", (long)day, hint,
-                  (unsigned)mon.free_size, (unsigned)mon.free_biggest_size);
-}
-
-// Built once on the top layer after the dialog, so it draws above it, and shown on
-// demand like the dialog.
-static void setup_overlay()
-{
-    // same black veil as the dialog, so swapping dialog for card does not flash the hero
-    overlay = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(overlay, 320, 240);
-    lv_obj_set_pos(overlay, 0, 0);
-    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
-    lv_obj_set_style_border_width(overlay, 0, 0);
-    lv_obj_set_style_radius(overlay, 0, 0);
-    lv_obj_set_style_pad_all(overlay, 0, 0);
-    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(overlay, on_overlay_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-
-    // darker than the "Ja" green: white text reads at about 5:1 instead of 3.3:1.
-    // Card, row and circle are not clickable, so every tap reaches the backdrop;
-    // not scrollable, so the overshoot never shows a scrollbar.
-    overlay_card = lv_obj_create(overlay);
-    lv_obj_set_size(overlay_card, 296, LV_SIZE_CONTENT);
-    lv_obj_center(overlay_card);
-    lv_obj_set_style_bg_color(overlay_card, lv_color_hex(0x2E7D32), 0);
-    lv_obj_set_style_border_width(overlay_card, 0, 0);
-    lv_obj_set_style_radius(overlay_card, 10, 0);
-    lv_obj_set_style_pad_all(overlay_card, 12, 0);
-    lv_obj_set_style_pad_row(overlay_card, 6, 0);
-    // a column, because the bins and hint lines wrap to one or two lines
-    lv_obj_set_flex_flow(overlay_card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(overlay_card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(overlay_card, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(overlay_card, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *row = lv_obj_create(overlay_card);
-    lv_obj_set_size(row, 240, 84);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-    overlay_circle = lv_obj_create(row);
-    lv_obj_set_size(overlay_circle, ov_circle, ov_circle);
-    lv_obj_align(overlay_circle, LV_ALIGN_LEFT_MID, 8, 0);
-    lv_obj_set_style_bg_color(overlay_circle, lv_color_white(), 0);
-    lv_obj_set_style_border_width(overlay_circle, 0, 0);
-    lv_obj_set_style_radius(overlay_circle, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_all(overlay_circle, 0, 0);
-    lv_obj_clear_flag(overlay_circle, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(overlay_circle, LV_OBJ_FLAG_SCROLLABLE);
-
-    // in the card's green: where the square clip of a growing circle lets the glyph
-    // past the round edge, it vanishes into the card
-    overlay_check = lv_label_create(overlay_circle);
-    lv_obj_set_style_text_font(overlay_check, &symbol_check_48, 0);
-    lv_obj_set_style_text_color(overlay_check, lv_color_hex(0x2E7D32), 0);
-    lv_label_set_text(overlay_check, LV_SYMBOL_OK);
-    lv_obj_center(overlay_check);
-
-    lv_obj_t *title = lv_label_create(row);
-    lv_obj_set_style_text_font(title, &montserrat_de_32, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_label_set_text(title, "Erledigt");
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, 102, 0);
-
-    overlay_types = lv_label_create(overlay_card);
-    lv_obj_set_style_text_font(overlay_types, &montserrat_de_20, 0);
-    lv_obj_set_style_text_color(overlay_types, lv_color_hex(0xE8F5E9), 0);
-    lv_obj_set_width(overlay_types, 272);
-    lv_label_set_long_mode(overlay_types, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(overlay_types, LV_TEXT_ALIGN_CENTER, 0);
-
-    overlay_hint = lv_label_create(overlay_card);
-    lv_obj_set_style_text_font(overlay_hint, &montserrat_de_16, 0);
-    lv_obj_set_style_text_color(overlay_hint, lv_color_hex(0xFFE082), 0);
-    lv_obj_set_width(overlay_hint, 272);
-    lv_label_set_long_mode(overlay_hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(overlay_hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_flag(overlay_hint, LV_OBJ_FLAG_HIDDEN);
-
-    overlay_timer = lv_timer_create(on_overlay_timer, ov_hold_ms, NULL);
-    lv_timer_pause(overlay_timer);
-
-#ifdef TEST_HOOKS
-    // counts real frames: the refresh timer pauses itself when nothing is invalid,
-    // and RENDER_READY skips the runs that found nothing to draw
-    lv_display_add_event_cb(lv_display_get_default(), on_render_ready, LV_EVENT_RENDER_READY, NULL);
-#endif
-}
 
 void setup_ui()
 {
@@ -943,7 +730,6 @@ void setup_ui()
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE); // a shaky finger still counts as a tap
-    lv_obj_add_event_cb(scr, on_screen_clicked, LV_EVENT_CLICKED, NULL);
 
     content = lv_obj_create(scr);
     lv_obj_set_size(content, 320, 222);
@@ -971,8 +757,8 @@ void setup_ui()
     lv_obj_align(ack_label, LV_ALIGN_BOTTOM_RIGHT, -6, -3);
     lv_obj_add_flag(ack_label, LV_OBJ_FLAG_HIDDEN);
 
-    setup_dialog();
-    setup_overlay(); // after the dialog: same layer, drawn above it
+    setup_undo();
+    celebration_setup(); // last on the top layer: particles draw above everything
     setup_touch();
 }
 
@@ -990,13 +776,15 @@ static bool had_valid_time = false;
 // year's rows, and a reboot drops them. The acknowledgement of an injected day
 // is persisted like any other and would hide a real pickup on that date, so
 // send x before the test ends.
-//   h  Gelber Sack tomorrow and Altpapier the day after: a hero, and after
-//      "Ja" the done card with "Danach: Altpapier übermorgen", then the next hero
-//   s  Gelber Sack tomorrow alone: a hero whose done card has no "Danach" line
-//   0  Restmüll today: a "HEUTE:" hero; only before the rollover hour, later
-//      the key just says so
-//   x  lift the acknowledgement
-//   u  re-render (logs "render deferred" while the done card is up)
+//   h  Gelber Sack tomorrow and Altpapier the day after: a hero for tomorrow
+//      with Altpapier "in 2 Tg." among the rows below it
+//   s  Gelber Sack tomorrow alone: a hero; "Erledigt" turns it into the done
+//      hero (check pops, bars dim) with "Rückgängig" for 30 s, then the list
+//   0  Restmüll today: no hero, a list row "heute"; only before the rollover
+//      hour, later the key just says so
+//   x  lift the acknowledgement (also ends a running undo window)
+//   c  cycle the celebration: random, then each kind in turn (logs the choice)
+//   u  re-render
 //   w  start a fetch window now. The fetch drops injected dates of the current
 //      year; on 30 and 31 December an injected date can fall into next year and
 //      would be saved with the cache, so do not use w after h or s on those days.
@@ -1025,6 +813,13 @@ static void test_hooks()
     while (Serial.available() > 0)
     {
         int c = Serial.read();
+        if (c == 'c')
+        {
+            celebration_force = (celebration_force + 2) % (CEL_KINDS + 1) - 1; // -1, 0 .. CEL_KINDS-1
+            Serial.printf("test: celebration %s\n",
+                          celebration_force < 0 ? "random" : cel_kinds[celebration_force].name);
+            continue;
+        }
         if (c != 'h' && c != 's' && c != '0' && c != 'x' && c != 'u' && c != 'w')
         {
             continue; // line endings and unknown keys
@@ -1145,10 +940,10 @@ void loop()
         last_render_ms = now_ms;
     }
 
-    // a fetch window blocks the loop for seconds and would freeze the done card
-    // mid-animation; a window that comes due while the card is up waits for
-    // the reveal, at most about 2.5 s
-    if (time_valid && now >= next_fetch_epoch && overlay_state == OV_IDLE)
+    // a fetch window blocks the loop for seconds and would freeze the celebration
+    // and the undo countdown; a window that comes due meanwhile waits for the
+    // undo window to close, at most undo_window_s
+    if (time_valid && now >= next_fetch_epoch && undo_day < 0)
     {
         setCpuFrequencyMhz(240); // TLS handshakes are sluggish at 80 MHz
         WiFi.mode(WIFI_STA);     // grey icon while associating

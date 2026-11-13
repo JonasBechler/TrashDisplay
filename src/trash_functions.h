@@ -792,29 +792,6 @@ static bool pickup_pending(int32_t d, int32_t today, int hour)
     return d > acked_day;
 }
 
-// Undo lifts only the newest acknowledged day: the mark steps back to the latest
-// earlier pickup day still ahead, which stays acknowledged, or is cleared if none is.
-static void ack_step_back(int32_t today, int hour)
-{
-    int32_t prev = -1;
-    for (int i = 0; i < pickup_count && pickups[i].day < acked_day; i++) // sorted ascending
-    {
-        int32_t d = pickups[i].day;
-        if (d > today || (d == today && hour < rollover_hour))
-        {
-            prev = d;
-        }
-    }
-    if (prev >= 0)
-    {
-        ack_set(prev);
-    }
-    else
-    {
-        ack_clear();
-    }
-}
-
 
 // ---------------------------------------------------------------- refresh
 
